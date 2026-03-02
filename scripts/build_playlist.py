@@ -30,7 +30,8 @@ import urllib.request
 SPOTIFY_API = "https://api.spotify.com/v1"
 SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token"
 ENV_PATH = os.path.expanduser("~/Music/.env")
-RATE_LIMIT_DELAY = 0.1  # seconds between API requests
+RATE_LIMIT_DELAY = 0.5  # seconds between API requests (0.1 causes 502 cascades)
+MAX_RETRIES = 3  # retries on transient errors (429, 500, 502, 503)
 
 
 def load_credentials():
@@ -80,34 +81,51 @@ def get_access_token(creds):
         sys.exit(1)
 
 
+RETRYABLE_STATUS_CODES = {429, 500, 502, 503}
+
+
 def api_get(url, token):
-    """Make authenticated GET request to Spotify API."""
-    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
-    try:
-        return json.loads(urllib.request.urlopen(req).read())
-    except urllib.error.HTTPError as e:
-        body = e.read().decode()[:200]
-        print(f"  GET {e.code}: {url} -- {body}", file=sys.stderr)
-        return None
+    """Make authenticated GET request to Spotify API with retry on transient errors."""
+    for attempt in range(MAX_RETRIES + 1):
+        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+        try:
+            return json.loads(urllib.request.urlopen(req).read())
+        except urllib.error.HTTPError as e:
+            if e.code in RETRYABLE_STATUS_CODES and attempt < MAX_RETRIES:
+                wait = (attempt + 1) * 2
+                print(f"    Retry {attempt+1}/{MAX_RETRIES} after {e.code}, waiting {wait}s...", file=sys.stderr)
+                time.sleep(wait)
+                continue
+            body = e.read().decode()[:200]
+            print(f"  GET {e.code}: {url} -- {body}", file=sys.stderr)
+            return None
+    return None
 
 
 def api_post(url, payload, token):
-    """Make authenticated POST request to Spotify API."""
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(payload).encode(),
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-        },
-        method="POST",
-    )
-    try:
-        return json.loads(urllib.request.urlopen(req).read())
-    except urllib.error.HTTPError as e:
-        body = e.read().decode()[:200]
-        print(f"  POST {e.code}: {url} -- {body}", file=sys.stderr)
-        return None
+    """Make authenticated POST request to Spotify API with retry on transient errors."""
+    for attempt in range(MAX_RETRIES + 1):
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode(),
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            return json.loads(urllib.request.urlopen(req).read())
+        except urllib.error.HTTPError as e:
+            if e.code in RETRYABLE_STATUS_CODES and attempt < MAX_RETRIES:
+                wait = (attempt + 1) * 2
+                print(f"    Retry {attempt+1}/{MAX_RETRIES} after {e.code}, waiting {wait}s...", file=sys.stderr)
+                time.sleep(wait)
+                continue
+            body = e.read().decode()[:200]
+            print(f"  POST {e.code}: {url} -- {body}", file=sys.stderr)
+            return None
+    return None
 
 
 def search_track(artist, album, track_name, token):
@@ -214,6 +232,9 @@ def main():
     parser.add_argument("--name", required=True, help="Playlist name")
     parser.add_argument("--description", default="", help="Playlist description")
     parser.add_argument("--input", required=True, help="Path to JSON input file")
+    parser.add_argument("--playlist-id", default=None,
+                        help="Add tracks to an existing playlist instead of creating a new one. "
+                             "Useful for retrying after 502 failures.")
     args = parser.parse_args()
 
     # Load input tracks
@@ -262,20 +283,26 @@ def main():
         print("No tracks found, aborting", file=sys.stderr)
         sys.exit(1)
 
-    # Create playlist
-    playlist = create_playlist(args.name, args.description, token)
-    playlist_url = playlist.get("external_urls", {}).get("spotify", "")
-    print(f"Created playlist: {args.name}", file=sys.stderr)
-    print(f"URL: {playlist_url}", file=sys.stderr)
+    # Create or reuse playlist
+    if args.playlist_id:
+        playlist_id = args.playlist_id
+        playlist_url = f"https://open.spotify.com/playlist/{playlist_id}"
+        print(f"Adding to existing playlist: {playlist_url}", file=sys.stderr)
+    else:
+        playlist = create_playlist(args.name, args.description, token)
+        playlist_id = playlist["id"]
+        playlist_url = playlist.get("external_urls", {}).get("spotify", "")
+        print(f"Created playlist: {args.name}", file=sys.stderr)
+        print(f"URL: {playlist_url}", file=sys.stderr)
 
     # Add tracks
     uris = [t["uri"] for t in found_tracks]
-    added = add_tracks_to_playlist(playlist["id"], uris, token)
+    added = add_tracks_to_playlist(playlist_id, uris, token)
     print(f"Added {added} tracks to playlist", file=sys.stderr)
 
     # Output JSON result to stdout
     output = {
-        "playlist_id": playlist["id"],
+        "playlist_id": playlist_id,
         "playlist_url": playlist_url,
         "playlist_name": args.name,
         "tracks_searched": len(entries),
